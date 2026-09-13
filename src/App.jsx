@@ -38,87 +38,104 @@ function findKeyExact(keys, exactName) {
   return keys.find((k) => k.trim().toLowerCase() === target) || null;
 }
 
-// Reads delivery/box/qty for one side ("client" or "factory") using the
-// profile's columnMappings. No auto-detection — headers must match exactly.
-function parseSheet(json, columnMappings, side) {
-  const getHeader = (key) => columnMappings.find((m) => m.key === key)?.[side] || "";
+// Reads a field's value, falling back to an alternate header if the
+// primary header is missing/blank for that row (e.g. "Receipt" is filled
+// but "Dispatch" is empty, or vice versa).
+function readField(row, keys, primaryHeader, altHeader) {
+  const primaryKey = findKeyExact(keys, primaryHeader);
+  let value = primaryKey ? String(row[primaryKey] ?? "").trim() : "";
+  if (!value && altHeader) {
+    const altKey = findKeyExact(keys, altHeader);
+    if (altKey) value = String(row[altKey] ?? "").trim();
+  }
+  return value;
+}
 
-  const deliveryHeader = getHeader("delivery");
-  const boxHeader = getHeader("box");
-  const qtyHeader = getHeader("qty");
+// Reads delivery/box/qty for one side ("client" or "factory") using the
+// profile's columnMappings. No auto-detection — headers must match exactly
+// (with an optional alternate header as a fallback for blank cells).
+function parseSheet(json, columnMappings, side) {
+  const altField = side === "client" ? "clientAlt" : "factoryAlt";
+  const getMapping = (key) => columnMappings.find((m) => m.key === key);
+
+  const deliveryMap = getMapping("delivery");
+  const boxMap = getMapping("box");
+  const qtyMap = getMapping("qty");
   const customMappings = columnMappings.filter((m) => m.key === "custom" && m.label.trim());
 
   return json
     .map((row) => {
       const keys = Object.keys(row);
-      const deliveryKey = findKeyExact(keys, deliveryHeader);
-      const qtyKey = findKeyExact(keys, qtyHeader);
-      const boxKey = findKeyExact(keys, boxHeader);
 
-      if (!deliveryKey && !qtyKey) return null;
+      const delivery = deliveryMap ? readField(row, keys, deliveryMap[side], deliveryMap[altField]) : "";
+      const qty = qtyMap ? readField(row, keys, qtyMap[side], qtyMap[altField]) : "";
+      const box = boxMap ? readField(row, keys, boxMap[side], boxMap[altField]) : "";
+
+      if (!delivery && !qty) return null;
 
       const extra = {};
       customMappings.forEach((m) => {
-        const foundKey = findKeyExact(keys, m[side]);
-        extra[m.label] = foundKey ? String(row[foundKey] ?? "").trim() : "";
+        extra[m.label] = readField(row, keys, m[side], m[altField]);
       });
 
-      return {
-        id: Math.random().toString(36).slice(2),
-        delivery: String(row[deliveryKey] ?? "").trim(),
-        qty: String(row[qtyKey] ?? "").trim(),
-        box: boxKey ? String(row[boxKey] ?? "").trim() : "",
-        extra,
-      };
+      return { id: Math.random().toString(36).slice(2), delivery, qty, box, extra };
     })
     .filter(Boolean);
 }
 
-// Multiple line items can share the same delivery number (e.g. several
-// boxes shipped under one DN). Sum their quantities into a single row per
-// delivery before comparing, so nothing gets silently dropped.
-function aggregateByDelivery(rows) {
-  const byDelivery = new Map();
+// Sums quantities for rows sharing the same delivery number AND box number
+// (so a repeated DN+Box combination adds up rather than duplicating), while
+// keeping every distinct box under a delivery visible rather than picking
+// just one.
+function aggregateByDeliveryAndBox(rows) {
+  const byKey = new Map();
 
   rows.forEach((r) => {
-    const key = r.delivery.trim();
-    if (!key) return;
+    const delivery = r.delivery.trim();
+    if (!delivery) return;
+    const box = (r.box || "").trim();
+    const key = `${delivery}|||${box}`;
 
-    if (!byDelivery.has(key)) {
-      byDelivery.set(key, { id: r.id, delivery: key, qty: 0, box: r.box, boxes: new Set(), extra: r.extra });
+    if (!byKey.has(key)) {
+      byKey.set(key, { delivery, box, qty: 0 });
     }
-    const entry = byDelivery.get(key);
-    entry.qty += parseFloat(r.qty) || 0;
-    if (r.box) entry.boxes.add(r.box);
-    if (!entry.box && r.box) entry.box = r.box;
+    byKey.get(key).qty += parseFloat(r.qty) || 0;
   });
 
-  return [...byDelivery.values()].map((entry) => ({
-    id: entry.id,
-    delivery: entry.delivery,
-    qty: String(entry.qty),
-    box: entry.box,
-    // If a delivery spans more than one box, keep that visible instead of
-    // silently picking one.
-    boxCount: entry.boxes.size,
-    extra: entry.extra,
-  }));
+  return [...byKey.values()];
+}
+
+// Rolls box-level rows up into one summary per delivery number: a total
+// quantity (used for match/mismatch comparison) plus the full list of boxes
+// that make up that total (used for display, so nothing is hidden).
+function summarizeByDelivery(boxLevelRows) {
+  const byDelivery = new Map();
+
+  boxLevelRows.forEach((r) => {
+    if (!byDelivery.has(r.delivery)) {
+      byDelivery.set(r.delivery, { delivery: r.delivery, totalQty: 0, boxes: [] });
+    }
+    const entry = byDelivery.get(r.delivery);
+    entry.totalQty += r.qty;
+    entry.boxes.push({ box: r.box, qty: r.qty });
+  });
+
+  return byDelivery;
 }
 
 function matchByDelivery(clientRows, factoryRows) {
-  const deliveries = new Set([
-    ...clientRows.map((r) => r.delivery.trim()).filter(Boolean),
-    ...factoryRows.map((r) => r.delivery.trim()).filter(Boolean),
-  ]);
+  const clientSummary = summarizeByDelivery(clientRows);
+  const factorySummary = summarizeByDelivery(factoryRows);
+  const deliveries = new Set([...clientSummary.keys(), ...factorySummary.keys()]);
 
   return [...deliveries].sort().map((delivery) => {
-    const c = clientRows.find((r) => r.delivery.trim() === delivery);
-    const f = factoryRows.find((r) => r.delivery.trim() === delivery);
+    const c = clientSummary.get(delivery);
+    const f = factorySummary.get(delivery);
 
     let status;
     if (!f) status = "missing_factory";
     else if (!c) status = "missing_client";
-    else if ((parseFloat(c.qty) || 0) !== (parseFloat(f.qty) || 0)) status = "mismatch";
+    else if (c.totalQty !== f.totalQty) status = "mismatch";
     else status = "match";
 
     return { delivery, c, f, status };
@@ -132,22 +149,33 @@ function describeDifference(status) {
   return "";
 }
 
+// If no explicit client→factory mapping exists for this box (either because
+// the mapping table is empty, or this particular box just isn't in it), we
+// assume the box is named the same on both sides rather than hiding it.
 function resolveFactoryBox(clientBox, boxMappings) {
   if (!clientBox) return "";
   const match = boxMappings.find((m) => m.clientBox.trim() === clientBox.trim());
-  return match ? match.factoryBox : "";
+  return match ? match.factoryBox : clientBox;
 }
 
 function downloadResultsAsExcel(results, boxMappings) {
-  const data = results.map((r) => ({
-    Type: r.type,
-    "Delivery note": r.delivery,
-    "Client box number": r.c?.box || "",
-    "Factory box (mapped)": resolveFactoryBox(r.c?.box, boxMappings) || "",
-    "Client portal qty": r.c?.qty || "",
-    "Factory portal qty": r.f?.qty || "",
-    Difference: describeDifference(r.status),
-  }));
+  const data = [];
+
+  results.forEach((r) => {
+    const boxes = r.c?.boxes?.length ? r.c.boxes : [{ box: "", qty: "" }];
+    boxes.forEach((b) => {
+      data.push({
+        Type: r.type,
+        "Delivery note": r.delivery,
+        "Client box number": b.box || "",
+        "Client box qty": b.qty || "",
+        "Factory box (mapped)": resolveFactoryBox(b.box, boxMappings) || "",
+        "Client total qty": r.c?.totalQty ?? "",
+        "Factory total qty": r.f?.totalQty ?? "",
+        Difference: describeDifference(r.status),
+      });
+    });
+  });
 
   const worksheet = XLSX.utils.json_to_sheet(data);
   const workbook = XLSX.utils.book_new();
@@ -159,9 +187,9 @@ function downloadResultsAsExcel(results, boxMappings) {
 
 function defaultColumnMappings() {
   return [
-    { id: "delivery", key: "delivery", label: "Delivery note", client: "", factory: "", removable: false },
-    { id: "box", key: "box", label: "Box number", client: "", factory: "", removable: false },
-    { id: "qty", key: "qty", label: "Quantity", client: "", factory: "", removable: false },
+    { id: "delivery", key: "delivery", label: "Delivery note", client: "", clientAlt: "", factory: "", factoryAlt: "", removable: false },
+    { id: "box", key: "box", label: "Box number", client: "", clientAlt: "", factory: "", factoryAlt: "", removable: false },
+    { id: "qty", key: "qty", label: "Quantity", client: "", clientAlt: "", factory: "", factoryAlt: "", removable: false },
   ];
 }
 
@@ -218,6 +246,19 @@ function UploadPanel({ theme, title, accent, onFile, fileName, fileError, disabl
   );
 }
 
+function BoxList({ boxes, theme, mode, boxMappings }) {
+  if (!boxes || boxes.length === 0) return <span className={theme.muted}>—</span>;
+  return (
+    <div className="flex flex-col gap-0.5">
+      {boxes.map((b, i) => (
+        <span key={i} className={`font-mono text-xs ${theme.heading}`}>
+          {mode === "factory-mapped" ? resolveFactoryBox(b.box, boxMappings) || "—" : `${b.box || "—"} (${b.qty})`}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function ResultsTable({ theme, results, boxMappings }) {
   return (
     <div className="mb-6">
@@ -239,26 +280,23 @@ function ResultsTable({ theme, results, boxMappings }) {
         <div className={`grid grid-cols-7 gap-3 px-4 py-2.5 border-b ${theme.tabBorder} text-[11px] uppercase tracking-wide ${theme.muted} font-medium`}>
           <span>Type</span>
           <span>Delivery note</span>
-          <span>Client box number</span>
-          <span>Factory box (mapped)</span>
-          <span>Client portal qty</span>
-          <span>Factory portal qty</span>
+          <span>Client boxes (qty)</span>
+          <span>Factory boxes (mapped)</span>
+          <span>Client total qty</span>
+          <span>Factory total qty</span>
           <span>Difference</span>
         </div>
         {results.length === 0 ? (
           <div className={`px-4 py-4 text-sm ${theme.muted}`}>No differences found — everything matches.</div>
         ) : (
           results.map((r) => (
-            <div key={`${r.type}-${r.delivery}`} className={`grid grid-cols-7 gap-3 px-4 py-2.5 border-b ${theme.rowBorder} items-center text-sm last:border-b-0`}>
+            <div key={`${r.type}-${r.delivery}`} className={`grid grid-cols-7 gap-3 px-4 py-2.5 border-b ${theme.rowBorder} items-start text-sm last:border-b-0`}>
               <span className={`text-xs ${theme.subtle}`}>{r.type}</span>
               <span className={`font-mono ${theme.heading}`}>{r.delivery}</span>
-              <span className={`font-mono ${theme.heading}`}>
-                {r.c?.box || "—"}
-                {r.c?.boxCount > 1 && <span className={`ml-1 text-[10px] ${theme.subtle}`}>(+{r.c.boxCount - 1} more)</span>}
-              </span>
-              <span className={`font-mono ${theme.subtle}`}>{resolveFactoryBox(r.c?.box, boxMappings) || "—"}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.c?.qty || "—"}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.f?.qty || "—"}</span>
+              <BoxList boxes={r.c?.boxes} theme={theme} mode="client" />
+              <BoxList boxes={r.c?.boxes} theme={theme} mode="factory-mapped" boxMappings={boxMappings} />
+              <span className={`font-mono ${theme.heading}`}>{r.c ? r.c.totalQty : "—"}</span>
+              <span className={`font-mono ${theme.heading}`}>{r.f ? r.f.totalQty : "—"}</span>
               <span className={`text-xs font-medium ${theme.danger}`}>{describeDifference(r.status)}</span>
             </div>
           ))
@@ -305,7 +343,7 @@ function ReconciliationTab({ theme, profiles, selectedProfileId, setSelectedProf
         const workbook = XLSX.read(data, { type: "array" });
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-        const rows = aggregateByDelivery(parseSheet(json, selectedProfile.columnMappings, side));
+        const rows = aggregateByDeliveryAndBox(parseSheet(json, selectedProfile.columnMappings, side));
 
         if (rows.length === 0) {
           setFiles((f) => ({ ...f, [key]: { name: file.name, error: "Columns don't match this profile's mapping" } }));
@@ -429,57 +467,83 @@ function ReconciliationTab({ theme, profiles, selectedProfileId, setSelectedProf
 // ---------- Client Profile tab ----------
 
 function ColumnMappingTable({ theme, mappings, setMappings }) {
+  const [collapsed, setCollapsed] = useState({});
+
   const updateRow = (id, field, value) => setMappings(mappings.map((m) => (m.id === id ? { ...m, [field]: value } : m)));
   const removeRow = (id) => setMappings(mappings.filter((m) => m.id !== id));
   const addRow = () =>
-    setMappings([...mappings, { id: Math.random().toString(36).slice(2), key: "custom", label: "", client: "", factory: "", removable: true }]);
+    setMappings([
+      ...mappings,
+      { id: Math.random().toString(36).slice(2), key: "custom", label: "", client: "", clientAlt: "", factory: "", factoryAlt: "", removable: true },
+    ]);
+
+  const toggle = (side) => setCollapsed((prev) => ({ ...prev, [side]: !prev[side] }));
+
+  const cols = "1fr 1fr 1fr 28px";
+
+  const renderSide = (side, sideLabel) => {
+    const isOpen = !collapsed[side];
+    const altField = side === "client" ? "clientAlt" : "factoryAlt";
+
+    return (
+      <div className={`border-b ${theme.rowBorder} last:border-b-0`}>
+        <button onClick={() => toggle(side)} className="flex items-center gap-1.5 px-4 py-2.5 w-full text-left">
+          <ChevronRight size={14} className={`transition-transform ${isOpen ? "rotate-90" : ""} ${theme.muted}`} />
+          <span className={`text-sm font-semibold ${theme.heading}`}>{sideLabel}</span>
+        </button>
+
+        {isOpen && (
+          <div className="px-4 pb-3 flex flex-col gap-1.5">
+            <div className={`grid gap-2 text-[10px] uppercase tracking-wide font-medium ${theme.muted}`} style={{ gridTemplateColumns: cols }}>
+              <span>Field</span>
+              <span>Header from export</span>
+              <span>Alternative</span>
+              <span />
+            </div>
+            {mappings.map((m) => (
+              <div key={m.id} className="grid gap-2 items-center" style={{ gridTemplateColumns: cols }}>
+                {m.removable ? (
+                  <input
+                    value={m.label}
+                    onChange={(e) => updateRow(m.id, "label", e.target.value)}
+                    placeholder="e.g. Document date"
+                    className={`border px-2 py-1 text-sm ${theme.input}`}
+                  />
+                ) : (
+                  <span className={`text-sm px-2 py-1 ${theme.heading}`}>{m.label}</span>
+                )}
+                <input
+                  value={m[side]}
+                  onChange={(e) => updateRow(m.id, side, e.target.value)}
+                  placeholder="Export header"
+                  className={`border px-2 py-1 text-sm font-mono ${theme.input}`}
+                />
+                <input
+                  value={m[altField]}
+                  onChange={(e) => updateRow(m.id, altField, e.target.value)}
+                  placeholder="If blank, use…"
+                  className={`border px-2 py-1 text-sm font-mono ${theme.input}`}
+                />
+                {m.removable ? (
+                  <button onClick={() => removeRow(m.id)} className={`flex items-center justify-center ${theme.iconMuted}`} aria-label="Remove field">
+                    <Trash2 size={14} />
+                  </button>
+                ) : (
+                  <span />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className={`border ${theme.panel}`}>
-      <div
-        className={`grid gap-2 px-4 py-2 border-b ${theme.tabBorder} text-[11px] uppercase tracking-wide font-medium ${theme.muted}`}
-        style={{ gridTemplateColumns: "1fr 1fr 1fr 28px" }}
-      >
-        <span>Field</span>
-        <span>Client</span>
-        <span>Factory</span>
-        <span />
-      </div>
-      <div className="px-4 py-2 flex flex-col gap-1.5">
-        {mappings.map((m) => (
-          <div key={m.id} className="grid gap-2" style={{ gridTemplateColumns: "1fr 1fr 1fr 28px" }}>
-            {m.removable ? (
-              <input
-                value={m.label}
-                onChange={(e) => updateRow(m.id, "label", e.target.value)}
-                placeholder="e.g. Document date"
-                className={`border px-2 py-1 text-sm ${theme.input}`}
-              />
-            ) : (
-              <span className={`text-sm px-2 py-1 ${theme.heading}`}>{m.label}</span>
-            )}
-            <input
-              value={m.client}
-              onChange={(e) => updateRow(m.id, "client", e.target.value)}
-              placeholder="Export header"
-              className={`border px-2 py-1 text-sm font-mono ${theme.input}`}
-            />
-            <input
-              value={m.factory}
-              onChange={(e) => updateRow(m.id, "factory", e.target.value)}
-              placeholder="Export header"
-              className={`border px-2 py-1 text-sm font-mono ${theme.input}`}
-            />
-            {m.removable ? (
-              <button onClick={() => removeRow(m.id)} className={`flex items-center justify-center ${theme.iconMuted}`} aria-label="Remove field">
-                <Trash2 size={14} />
-              </button>
-            ) : (
-              <span />
-            )}
-          </div>
-        ))}
-      </div>
+      {renderSide("client", "Client")}
+      {renderSide("factory", "Factory")}
+
       <div className={`px-4 py-2 border-t ${theme.rowBorder}`}>
         <button onClick={addRow} className={`text-xs flex items-center gap-1 font-medium ${theme.heading}`}>
           <Plus size={13} /> Add column
@@ -615,7 +679,10 @@ function ClientProfileTab({ theme, profiles, setProfiles, selectedProfileId, set
                 <div>
                   <h3 className={`text-sm font-semibold mb-1 ${theme.heading}`}>Export column mapping</h3>
                   <p className={`text-xs mb-3 ${theme.subtle}`}>
-                    Enter the exact column header used in each side's export. Add a column for anything extra this client requires, like document date.
+                    Enter the exact column header used in each side's export. Use the "(alt)" field for cases like
+                    "Receipt" / "Dispatch" columns where only one is filled per row — if the main header is blank,
+                    the alternate is checked instead. Add a column for anything extra this client requires, like
+                    document date.
                   </p>
                   <ColumnMappingTable
                     theme={theme}
@@ -662,7 +729,7 @@ function ClientProfileTab({ theme, profiles, setProfiles, selectedProfileId, set
 // ---------- App ----------
 
 export default function ReconciliationApp() {
-  const [darkMode, setDarkMode] = useState(false);
+  const [darkMode, setDarkMode] = useState(true);
   const [activeTab, setActiveTab] = useState("reconciliation");
   const [profiles, setProfiles] = useState([]);
   const [profilesLoaded, setProfilesLoaded] = useState(false);
@@ -706,7 +773,7 @@ export default function ReconciliationApp() {
   }, [profiles, selectedProfileId]);
 
   return (
-    <div className={`w-full min-h-full px-6 py-6 ${theme.page}`} style={{ fontFamily: "Inter, ui-sans-serif, system-ui" }}>
+    <div className={`w-full min-h-screen px-6 py-6 ${theme.page}`} style={{ fontFamily: "Inter, ui-sans-serif, system-ui" }}>
       <div className="max-w-5xl mx-auto">
         <div className="mb-5 flex items-start justify-between gap-4">
           <div>
