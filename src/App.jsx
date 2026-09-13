@@ -74,6 +74,37 @@ function parseSheet(json, columnMappings, side) {
     .filter(Boolean);
 }
 
+// Multiple line items can share the same delivery number (e.g. several
+// boxes shipped under one DN). Sum their quantities into a single row per
+// delivery before comparing, so nothing gets silently dropped.
+function aggregateByDelivery(rows) {
+  const byDelivery = new Map();
+
+  rows.forEach((r) => {
+    const key = r.delivery.trim();
+    if (!key) return;
+
+    if (!byDelivery.has(key)) {
+      byDelivery.set(key, { id: r.id, delivery: key, qty: 0, box: r.box, boxes: new Set(), extra: r.extra });
+    }
+    const entry = byDelivery.get(key);
+    entry.qty += parseFloat(r.qty) || 0;
+    if (r.box) entry.boxes.add(r.box);
+    if (!entry.box && r.box) entry.box = r.box;
+  });
+
+  return [...byDelivery.values()].map((entry) => ({
+    id: entry.id,
+    delivery: entry.delivery,
+    qty: String(entry.qty),
+    box: entry.box,
+    // If a delivery spans more than one box, keep that visible instead of
+    // silently picking one.
+    boxCount: entry.boxes.size,
+    extra: entry.extra,
+  }));
+}
+
 function matchByDelivery(clientRows, factoryRows) {
   const deliveries = new Set([
     ...clientRows.map((r) => r.delivery.trim()).filter(Boolean),
@@ -221,7 +252,10 @@ function ResultsTable({ theme, results, boxMappings }) {
             <div key={`${r.type}-${r.delivery}`} className={`grid grid-cols-7 gap-3 px-4 py-2.5 border-b ${theme.rowBorder} items-center text-sm last:border-b-0`}>
               <span className={`text-xs ${theme.subtle}`}>{r.type}</span>
               <span className={`font-mono ${theme.heading}`}>{r.delivery}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.c?.box || "—"}</span>
+              <span className={`font-mono ${theme.heading}`}>
+                {r.c?.box || "—"}
+                {r.c?.boxCount > 1 && <span className={`ml-1 text-[10px] ${theme.subtle}`}>(+{r.c.boxCount - 1} more)</span>}
+              </span>
               <span className={`font-mono ${theme.subtle}`}>{resolveFactoryBox(r.c?.box, boxMappings) || "—"}</span>
               <span className={`font-mono ${theme.heading}`}>{r.c?.qty || "—"}</span>
               <span className={`font-mono ${theme.heading}`}>{r.f?.qty || "—"}</span>
@@ -271,7 +305,7 @@ function ReconciliationTab({ theme, profiles, selectedProfileId, setSelectedProf
         const workbook = XLSX.read(data, { type: "array" });
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-        const rows = parseSheet(json, selectedProfile.columnMappings, side);
+        const rows = aggregateByDelivery(parseSheet(json, selectedProfile.columnMappings, side));
 
         if (rows.length === 0) {
           setFiles((f) => ({ ...f, [key]: { name: file.name, error: "Columns don't match this profile's mapping" } }));
