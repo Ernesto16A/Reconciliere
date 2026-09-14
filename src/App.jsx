@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Play, Upload, Plus, Trash2, Pencil, ChevronRight, Moon, Sun, Download } from "lucide-react";
+import { Play, Upload, Plus, Trash2, Pencil, ChevronRight, ChevronUp, ChevronDown, Moon, Sun, Download } from "lucide-react";
 import * as XLSX from "xlsx";
 
 // ---------- Theme ----------
@@ -268,10 +268,55 @@ function UploadPanel({ theme, title, accent, onFile, fileName, fileError, disabl
 }
 
 function ResultsTable({ theme, results, profile }) {
+  const [sort, setSort] = useState({ key: null, dir: "asc" });
+
   const clientExtraFields = (profile?.clientExtraFields || []).filter((f) => f.label.trim());
   const factoryExtraFields = (profile?.factoryExtraFields || []).filter((f) => f.label.trim());
-  const extraCount = clientExtraFields.length + factoryExtraFields.length;
-  const gridStyle = { gridTemplateColumns: `repeat(6, 1fr) ${extraCount ? `repeat(${extraCount}, 1fr)` : ""}`.trim() };
+
+  const columns = [
+    // "Delivery number" is a placeholder column for now — several delivery
+    // notes may share one delivery number, to be wired up later.
+    { id: "type", label: "Delivery number", getValue: (r) => r.type },
+    { id: "delivery", label: "Delivery note", getValue: (r) => r.delivery },
+    { id: "box", label: "Box", getValue: (r) => r.clientBox || r.factoryBox || "" },
+    { id: "clientQty", label: "Client qty", getValue: (r) => r.clientQty, numeric: true },
+    { id: "factoryQty", label: "Factory qty", getValue: (r) => r.factoryQty, numeric: true },
+    { id: "difference", label: "Difference", getValue: (r) => describeDifference(r.status) },
+    ...clientExtraFields.map((f) => ({ id: `ce-${f.id}`, label: `Client: ${f.label}`, getValue: (r) => r.clientExtra?.[f.label] || "" })),
+    ...factoryExtraFields.map((f) => ({ id: `fe-${f.id}`, label: `Factory: ${f.label}`, getValue: (r) => r.factoryExtra?.[f.label] || "" })),
+  ];
+
+  const toggleSort = (key) => {
+    setSort((prev) => (prev.key === key ? { key, dir: prev.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
+  };
+
+  const sortedResults = [...results];
+  if (sort.key) {
+    const col = columns.find((c) => c.id === sort.key);
+    sortedResults.sort((a, b) => {
+      const va = col.getValue(a);
+      const vb = col.getValue(b);
+      if (col.numeric) {
+        const na = va === null || va === undefined ? -Infinity : va;
+        const nb = vb === null || vb === undefined ? -Infinity : vb;
+        return sort.dir === "asc" ? na - nb : nb - na;
+      }
+      const sa = String(va ?? "").toLowerCase();
+      const sb = String(vb ?? "").toLowerCase();
+      if (sa < sb) return sort.dir === "asc" ? -1 : 1;
+      if (sa > sb) return sort.dir === "asc" ? 1 : -1;
+      return 0;
+    });
+  }
+
+  const gridStyle = { gridTemplateColumns: `repeat(${columns.length}, 1fr)` };
+
+  const cellClass = (col) => {
+    if (col.id === "difference") return `text-xs font-medium ${theme.danger}`;
+    if (col.id === "type") return `text-xs ${theme.subtle}`;
+    if (col.id.startsWith("ce-") || col.id.startsWith("fe-")) return `text-sm ${theme.subtle}`;
+    return `font-mono ${theme.heading}`;
+  };
 
   return (
     <div className="mb-6">
@@ -291,42 +336,28 @@ function ResultsTable({ theme, results, profile }) {
       </div>
       <div className={`border ${theme.panel} overflow-x-auto`}>
         <div className={`grid gap-3 px-4 py-2.5 border-b ${theme.tabBorder} text-[11px] uppercase tracking-wide ${theme.muted} font-medium`} style={gridStyle}>
-          {/* "Delivery number" is a placeholder header for now — several delivery
-              notes may share one delivery number, to be wired up later. */}
-          <span>Delivery number</span>
-          <span>Delivery note</span>
-          <span>Box</span>
-          <span>Client qty</span>
-          <span>Factory qty</span>
-          <span>Difference</span>
-          {clientExtraFields.map((f) => (
-            <span key={f.id}>Client: {f.label}</span>
-          ))}
-          {factoryExtraFields.map((f) => (
-            <span key={f.id}>Factory: {f.label}</span>
+          {columns.map((col) => (
+            <button key={col.id} onClick={() => toggleSort(col.id)} className={`flex items-center gap-1 text-left ${theme.rowHover}`}>
+              <span>{col.label}</span>
+              {sort.key === col.id &&
+                (sort.dir === "asc" ? <ChevronUp size={12} /> : <ChevronDown size={12} />)}
+            </button>
           ))}
         </div>
         {results.length === 0 ? (
           <div className={`px-4 py-4 text-sm ${theme.muted}`}>No differences found — everything matches.</div>
         ) : (
-          results.map((r, i) => (
+          sortedResults.map((r, i) => (
             <div key={i} className={`grid gap-3 px-4 py-2.5 border-b ${theme.rowBorder} items-center text-sm last:border-b-0`} style={gridStyle}>
-              <span className={`text-xs ${theme.subtle}`}>{r.type}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.delivery}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.clientBox || r.factoryBox || "—"}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.clientQty ?? "—"}</span>
-              <span className={`font-mono ${theme.heading}`}>{r.factoryQty ?? "—"}</span>
-              <span className={`text-xs font-medium ${theme.danger}`}>{describeDifference(r.status)}</span>
-              {clientExtraFields.map((f) => (
-                <span key={f.id} className={`text-sm ${theme.subtle}`}>
-                  {r.clientExtra?.[f.label] || "—"}
-                </span>
-              ))}
-              {factoryExtraFields.map((f) => (
-                <span key={f.id} className={`text-sm ${theme.subtle}`}>
-                  {r.factoryExtra?.[f.label] || "—"}
-                </span>
-              ))}
+              {columns.map((col) => {
+                const value = col.getValue(r);
+                const display = value === null || value === undefined || value === "" ? "—" : value;
+                return (
+                  <span key={col.id} className={cellClass(col)}>
+                    {display}
+                  </span>
+                );
+              })}
             </div>
           ))
         )}
@@ -577,6 +608,12 @@ function ColumnMappingTable({ theme, profile, updateProfile }) {
                       <input
                         value={f.label}
                         onChange={(e) => updateExtraField(side, f.id, "label", e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            addExtraField(side);
+                          }
+                        }}
                         placeholder="e.g. Document date"
                         className={`w-full border px-2 py-1 text-sm ${theme.input}`}
                         style={{ paddingRight: 28 }}
